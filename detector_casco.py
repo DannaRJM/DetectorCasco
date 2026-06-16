@@ -92,17 +92,28 @@ def cargar_modelo():
 # ─── Capturar snapshot de la cámara ──────────────────────────────────────────
 def capturar_snapshot():
     url = f'http://{CAM_HOST}:{CAM_PORT}{SNAPSHOT_PATH}'
-    try:
-        r = requests.get(
-            url,
-            auth=HTTPDigestAuth(CAM_USER, CAM_PASS),
-            timeout=10
-        )
-        if r.status_code == 200:
-            return r.content
-        log(f'[WARN] Cámara respondió {r.status_code}')
-    except Exception as e:
-        log(f'[ERROR] Snapshot: {e}')
+    for intento in range(3):
+        try:
+            r = requests.get(
+                url,
+                auth=HTTPDigestAuth(CAM_USER, CAM_PASS),
+                timeout=10
+            )
+            if r.status_code == 200:
+                return r.content
+            if r.status_code == 503:
+                # Cámara ocupada (otra conexión activa) — esperar y reintentar
+                log(f'[WARN] Cámara ocupada (503) — reintento {intento + 1}/3 en 5s...')
+                time.sleep(5)
+                continue
+            log(f'[WARN] Cámara respondió {r.status_code}')
+            return None
+        except Exception as e:
+            if intento < 2:
+                log(f'[WARN] Error de conexión ({e.__class__.__name__}) — reintento {intento + 1}/3')
+                time.sleep(5)
+            else:
+                log(f'[ERROR] Snapshot: {e}')
     return None
 
 # ─── Guardar snapshot en disco ────────────────────────────────────────────────
@@ -121,13 +132,15 @@ def guardar_snapshot(imagen_bytes, etiqueta=''):
 # ─── Detectar cascos con YOLO ─────────────────────────────────────────────────
 def detectar_cascos(imagen_bytes):
     """
-    Retorna (violaciones: list, imagen_anotada: bytes)
-    violaciones: lista de {'clase', 'confianza', 'bbox'}
+    Retorna (violaciones, con_casco, imagen_anotada_bytes)
+    violaciones : lista de detecciones SIN casco
+    con_casco   : número de personas CON casco detectadas
     """
     img = Image.open(io.BytesIO(imagen_bytes)).convert('RGB')
     results = modelo(img, conf=CONF_MIN, verbose=False)
 
     violaciones  = []
+    con_casco    = 0
     draw         = ImageDraw.Draw(img)
 
     try:
@@ -162,6 +175,7 @@ def detectar_cascos(imagen_bytes):
                 draw.text((x1 + 4, y1 - 20), f'⚠ SIN CASCO  {conf:.0%}', font=font_small, fill='white')
             else:
                 # Caja verde: lleva casco
+                con_casco += 1
                 draw.rectangle([x1, y1, x2, y2], outline='#00cc44', width=2)
                 draw.rectangle([x1, y1 - 22, x2, y1], fill='#00cc44')
                 draw.text((x1 + 4, y1 - 20), f'✓ CASCO  {conf:.0%}', font=font_small, fill='white')
@@ -172,7 +186,7 @@ def detectar_cascos(imagen_bytes):
 
     buf = io.BytesIO()
     img.save(buf, 'JPEG', quality=90)
-    return violaciones, buf.getvalue()
+    return violaciones, con_casco, buf.getvalue()
 
 # ─── Enviar alerta a Telegram con foto ───────────────────────────────────────
 def enviar_alerta_telegram(foto_bytes, caption):
@@ -212,46 +226,52 @@ def monitorear():
         try:
             imagen = capturar_snapshot()
             if imagen is None:
-                log('[WARN] Sin imagen — reintentando en 10s...')
-                time.sleep(10)
+                time.sleep(INTERVALO_S)
                 continue
 
             total_capturas += 1
-            violaciones, img_anotada = detectar_cascos(imagen)
+            violaciones, con_casco, img_anotada = detectar_cascos(imagen)
+            total_detectados = len(violaciones) + con_casco
 
-            if violaciones:
+            if total_detectados == 0:
+                # No hay nadie en el área
+                log(f'[{total_capturas}] Sin personas detectadas en el área')
+            elif violaciones:
+                # Hay personas sin casco
                 total_violaciones += 1
-                ahora = time.time()
-                n     = len(violaciones)
-                log(f'⚠ {n} trabajador(es) SIN CASCO detectado(s)')
+                n = len(violaciones)
+                log(f'[{total_capturas}] ⚠  SIN CASCO: {n}  |  Con casco: {con_casco}')
 
+                ahora = time.time()
                 if ahora - ultimo_alerta >= COOLDOWN_S:
                     ultimo_alerta = ahora
                     dt    = datetime.now()
                     hora  = dt.strftime('%H:%M:%S')
                     fecha = dt.strftime('%d/%m/%Y')
-
                     caption = '\n'.join([
                         '🚨 *ALERTA — TRABAJADOR SIN CASCO*',
                         '',
                         f'📍 *Zona:* {ZONA}',
-                        f'⚠️ *Detectados sin casco:* {n}',
+                        f'⚠️ *Sin casco:* {n}  |  ✅ *Con casco:* {con_casco}',
                         f'🕐 {hora}  |  📅 {fecha}',
                         '',
                         '_Por favor indíquele al trabajador que porte su casco_',
                         '_para evitar accidentes._',
                         '',
-                        f'_BluAx · Ocean Tech_'
+                        '_BluAx · Ocean Tech_'
                     ])
                     enviar_alerta_telegram(img_anotada, caption)
                     guardar_snapshot(img_anotada, 'VIOLACION')
                 else:
                     restante = int(COOLDOWN_S - (ahora - ultimo_alerta))
-                    log(f'[SPAM] Alerta suprimida ({restante}s restantes en cooldown)')
+                    log(f'    └─ Alerta suprimida ({restante}s restantes en cooldown)')
             else:
-                if total_capturas % 30 == 0:
-                    log(f'✅ Sin violaciones | capturas: {total_capturas} | alertas: {total_violaciones}')
+                # Todos llevan casco — OK
+                log(f'[{total_capturas}] ✅ Todos con casco ({con_casco} persona(s)) — OK')
 
+        except KeyboardInterrupt:
+            log('Sistema detenido por el usuario.')
+            break
         except Exception as e:
             log(f'[ERROR] ciclo principal: {e}')
 
