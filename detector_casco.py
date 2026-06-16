@@ -49,6 +49,8 @@ COOLDOWN_MIXTO_S = int(os.environ.get('ALERT_COOLDOWN_MIXTO', '120'))  # 2 min �
 MODELO_PATH   = os.environ.get('MODELO_PATH', './modelo/best.pt')
 SNAP_DIR      = Path(os.environ.get('SNAP_DIR', 'C:/DetectorCasco/snapshots'))
 ZONA          = os.environ.get('ZONA', 'Área de trabajo')
+HORA_INICIO   = os.environ.get('HORA_INICIO', '07:00')   # inicio jornada laboral
+HORA_FIN      = os.environ.get('HORA_FIN',    '18:00')   # fin jornada laboral
 
 SNAPSHOT_PATH = '/ISAPI/Streaming/channels/101/picture'
 
@@ -217,15 +219,68 @@ def enviar_texto_telegram(texto):
     except Exception:
         pass
 
+# ─── Horario laboral ──────────────────────────────────────────────────────────
+def parsear_hora(hhmm):
+    h, m = map(int, hhmm.split(':'))
+    return h * 60 + m
+
+def en_horario_laboral():
+    ahora = datetime.now()
+    minutos_ahora = ahora.hour * 60 + ahora.minute
+    return parsear_hora(HORA_INICIO) <= minutos_ahora <= parsear_hora(HORA_FIN)
+
+def minutos_para_inicio():
+    ahora = datetime.now()
+    minutos_ahora = ahora.hour * 60 + ahora.minute
+    inicio = parsear_hora(HORA_INICIO)
+    if minutos_ahora < inicio:
+        return inicio - minutos_ahora
+    # Ya pasó hoy — faltan hasta mañana
+    return (24 * 60 - minutos_ahora) + inicio
+
 # ─── Ciclo principal de monitoreo ─────────────────────────────────────────────
 def monitorear():
     global ultimo_alerta, ultimo_alerta_mix, total_capturas, total_violaciones
 
     log(f'Iniciando monitoreo — intervalo: {INTERVALO_S}s  cooldown: {COOLDOWN_S}s')
     log(f'Zona: {ZONA}  |  Cámara: {CAM_HOST}:{CAM_PORT}')
+    log(f'Horario activo: {HORA_INICIO} – {HORA_FIN}')
+
+    fuera_horario_notificado = False   # evita mandar el aviso de "fuera de horario" cada 60s
 
     while True:
         try:
+            # ── Verificar horario laboral ─────────────────────────────────────
+            if not en_horario_laboral():
+                if not fuera_horario_notificado:
+                    faltan = minutos_para_inicio()
+                    horas  = faltan // 60
+                    mins   = faltan % 60
+                    log(f'💤 Fuera de horario laboral ({HORA_INICIO}–{HORA_FIN}) — reanuda en {horas}h {mins}m')
+                    enviar_texto_telegram(
+                        f'💤 *Monitoreo en pausa*\n'
+                        f'📍 {ZONA}\n'
+                        f'🕐 Fuera de horario laboral ({HORA_INICIO} – {HORA_FIN})\n'
+                        f'⏰ Reanuda en *{horas}h {mins}m*\n'
+                        f'_BluAx · Ocean Tech_'
+                    )
+                    fuera_horario_notificado = True
+                time.sleep(60)  # revisar cada minuto si ya es hora
+                continue
+
+            # Entró al horario — notificar reanudación si estaba pausado
+            if fuera_horario_notificado:
+                log(f'🟢 Horario laboral iniciado — monitoreo activo')
+                enviar_texto_telegram(
+                    f'🟢 *Monitoreo activo*\n'
+                    f'📍 {ZONA}\n'
+                    f'🕐 Inicio de jornada: {HORA_INICIO}\n'
+                    f'_BluAx · Ocean Tech_'
+                )
+                fuera_horario_notificado = False
+                total_capturas    = 0
+                total_violaciones = 0
+
             imagen = capturar_snapshot()
             if imagen is None:
                 time.sleep(INTERVALO_S)
