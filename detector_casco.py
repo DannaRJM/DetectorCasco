@@ -46,6 +46,9 @@ INTERVALO_S   = int(os.environ.get('CHECK_INTERVAL', '10'))    # segundos entre 
 CONF_MIN      = float(os.environ.get('CONF_THRESHOLD', '0.50'))# confianza mínima YOLO
 COOLDOWN_S       = int(os.environ.get('ALERT_COOLDOWN',       '300'))  # 5 min — todos sin casco
 COOLDOWN_MIXTO_S = int(os.environ.get('ALERT_COOLDOWN_MIXTO', '120'))  # 2 min — algunos sin casco
+COOLDOWN_CRITICO_S  = int(os.environ.get('ALERT_COOLDOWN_CRITICO', '1800'))  # 30 min — zona crítica
+UMBRAL_CRITICO      = int(os.environ.get('UMBRAL_CRITICO',         '5'))     # violaciones para escalar
+VENTANA_CRITICA_S   = int(os.environ.get('VENTANA_CRITICA_MIN',    '30')) * 60  # ventana de análisis
 MODELO_PATH   = os.environ.get('MODELO_PATH', './modelo/best.pt')
 SNAP_DIR      = Path(os.environ.get('SNAP_DIR', 'C:/DetectorCasco/snapshots'))
 ZONA          = os.environ.get('ZONA', 'Área de trabajo')
@@ -68,11 +71,13 @@ except ImportError as e:
     print('[ERROR] Ejecuta: pip install -r requirements.txt')
 
 # ─── Estado global ─────────────────────────────────────────────────────────────
-modelo            = None
-ultimo_alerta     = 0    # timestamp último alerta "todos sin casco"
-ultimo_alerta_mix = 0    # timestamp último alerta "algunos sin casco"
-total_capturas    = 0
-total_violaciones = 0
+modelo               = None
+ultimo_alerta        = 0    # timestamp último alerta "todos sin casco"
+ultimo_alerta_mix    = 0    # timestamp último alerta "algunos sin casco"
+ultimo_alerta_critico = 0   # timestamp último alerta "zona crítica"
+historial_violaciones = []  # timestamps de cada violación (para ventana 30 min)
+total_capturas       = 0
+total_violaciones    = 0
 
 # ─── Log ──────────────────────────────────────────────────────────────────────
 def log(msg):
@@ -238,6 +243,45 @@ def minutos_para_inicio():
     # Ya pasó hoy — faltan hasta mañana
     return (24 * 60 - minutos_ahora) + inicio
 
+# ─── Escalado a ZONA CRÍTICA ─────────────────────────────────────────────────
+def verificar_zona_critica(img_anotada):
+    """Escala la alerta si hay más de UMBRAL_CRITICO violaciones en VENTANA_CRITICA_S segundos."""
+    global ultimo_alerta_critico, historial_violaciones
+
+    ahora = time.time()
+
+    # Registrar esta violación y descartar las fuera de la ventana
+    historial_violaciones.append(ahora)
+    historial_violaciones = [t for t in historial_violaciones if ahora - t <= VENTANA_CRITICA_S]
+
+    recuento = len(historial_violaciones)
+    ventana_min = VENTANA_CRITICA_S // 60
+
+    log(f'    └─ Reincidencia: {recuento}/{UMBRAL_CRITICO} violaciones en últimos {ventana_min} min')
+
+    if recuento > UMBRAL_CRITICO and (ahora - ultimo_alerta_critico) >= COOLDOWN_CRITICO_S:
+        ultimo_alerta_critico = ahora
+        dt    = datetime.now()
+        hora  = dt.strftime('%H:%M:%S')
+        fecha = dt.strftime('%d/%m/%Y')
+        log(f'🔴 ZONA CRÍTICA — {recuento} violaciones en {ventana_min} min — alerta escalada')
+        caption = '\n'.join([
+            '🔴 *⚠ ZONA CRÍTICA — INCUMPLIMIENTO REITERADO*',
+            '',
+            f'📍 *Zona:* {ZONA}',
+            f'📊 *Violaciones:* {recuento} en los últimos {ventana_min} minutos',
+            f'🕐 {hora}  |  📅 {fecha}',
+            '',
+            '_Se ha superado el umbral de incumplimiento._',
+            '_Se requiere intervención inmediata de supervisión._',
+            '',
+            '_BluAx · Ocean Tech_'
+        ])
+        enviar_alerta_telegram(img_anotada, caption)
+        guardar_snapshot(img_anotada, 'ZONA_CRITICA')
+        return True
+    return False
+
 # ─── Ciclo principal de monitoreo ─────────────────────────────────────────────
 def monitorear():
     global ultimo_alerta, ultimo_alerta_mix, total_capturas, total_violaciones
@@ -321,6 +365,7 @@ def monitorear():
                 else:
                     restante = int(COOLDOWN_S - (ahora - ultimo_alerta))
                     log(f'    └─ Suprimida — próxima en {restante}s')
+                verificar_zona_critica(img_anotada)
 
             elif violaciones and con_casco > 0:
                 # CASO 2: Mezcla — algunos con casco, algunos sin casco
@@ -350,6 +395,7 @@ def monitorear():
                 else:
                     restante = int(COOLDOWN_MIXTO_S - (ahora - ultimo_alerta_mix))
                     log(f'    └─ Suprimida — próxima en {restante}s')
+                verificar_zona_critica(img_anotada)
 
             else:
                 # Todos llevan casco — OK
