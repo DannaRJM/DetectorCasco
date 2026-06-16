@@ -55,7 +55,8 @@ ZONA          = os.environ.get('ZONA', 'Área de trabajo')
 HORA_INICIO   = os.environ.get('HORA_INICIO', '07:00')   # inicio jornada laboral
 HORA_FIN      = os.environ.get('HORA_FIN',    '18:00')   # fin jornada laboral
 
-SNAPSHOT_PATH = '/ISAPI/Streaming/channels/101/picture'
+SNAPSHOT_PATH  = '/ISAPI/Streaming/channels/101/picture'
+DASHBOARD_FILE = Path('C:/BluAxDashboard/estado.json')
 
 # ─── Dependencias opcionales ──────────────────────────────────────────────────
 try:
@@ -69,6 +70,34 @@ except ImportError as e:
     DISPONIBLE = False
     print(f'[ERROR] Faltan dependencias: {e}')
     print('[ERROR] Ejecuta: pip install -r requirements.txt')
+
+# ─── Dashboard compartido ────────────────────────────────────────────────────
+_dash_casco = {
+    'estado': 'activo',
+    'hoy':    {'capturas': 0, 'violaciones': 0, 'zona_critica': 0},
+    'alertas': []
+}
+
+def actualizar_dashboard(patch):
+    try:
+        DASHBOARD_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if 'hoy' in patch:
+            _dash_casco['hoy'].update(patch['hoy'])
+        if 'alerta' in patch:
+            _dash_casco['alertas'] = ([patch['alerta']] + _dash_casco['alertas'])[:10]
+        if 'estado' in patch:
+            _dash_casco['estado'] = patch['estado']
+        _dash_casco['ultima_actividad'] = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+        estado = {}
+        if DASHBOARD_FILE.exists():
+            try:
+                estado = json.loads(DASHBOARD_FILE.read_text(encoding='utf-8'))
+            except Exception:
+                pass
+        estado['casco'] = _dash_casco
+        DASHBOARD_FILE.write_text(json.dumps(estado, ensure_ascii=False, indent=2), encoding='utf-8')
+    except Exception:
+        pass
 
 # ─── Estado global ─────────────────────────────────────────────────────────────
 modelo               = None
@@ -265,6 +294,11 @@ def verificar_zona_critica(img_anotada):
         hora  = dt.strftime('%H:%M:%S')
         fecha = dt.strftime('%d/%m/%Y')
         log(f'🔴 ZONA CRÍTICA — {recuento} violaciones en {ventana_min} min — alerta escalada')
+        actualizar_dashboard({
+            'hoy':    {'zona_critica': _dash_casco['hoy']['zona_critica'] + 1},
+            'alerta': {'tipo': 'zona_critica', 'violaciones': recuento,
+                       'ts': datetime.now().strftime('%H:%M:%S')}
+        })
         caption = '\n'.join([
             '🔴 *⚠ ZONA CRÍTICA — INCUMPLIMIENTO REITERADO*',
             '',
@@ -309,6 +343,7 @@ def monitorear():
                         f'_BluAx · Ocean Tech_'
                     )
                     fuera_horario_notificado = True
+                    actualizar_dashboard({'estado': 'pausado'})
                 time.sleep(60)  # revisar cada minuto si ya es hora
                 continue
 
@@ -324,6 +359,7 @@ def monitorear():
                 fuera_horario_notificado = False
                 total_capturas    = 0
                 total_violaciones = 0
+                actualizar_dashboard({'estado': 'activo'})
 
             imagen = capturar_snapshot()
             if imagen is None:
@@ -331,6 +367,7 @@ def monitorear():
                 continue
 
             total_capturas += 1
+            actualizar_dashboard({'hoy': {'capturas': _dash_casco['hoy']['capturas'] + 1}})
             violaciones, con_casco, img_anotada = detectar_cascos(imagen)
             total_detectados = len(violaciones) + con_casco
 
@@ -342,6 +379,11 @@ def monitorear():
                 total_violaciones += 1
                 n = len(violaciones)
                 log(f'[{total_capturas}] 🚨 TODOS SIN CASCO: {n} persona(s)')
+                actualizar_dashboard({
+                    'hoy':    {'violaciones': _dash_casco['hoy']['violaciones'] + 1},
+                    'alerta': {'tipo': 'todos_sin_casco', 'personas': n,
+                               'ts': datetime.now().strftime('%H:%M:%S')}
+                })
                 ahora = time.time()
                 if ahora - ultimo_alerta >= COOLDOWN_S:
                     ultimo_alerta = ahora
@@ -372,6 +414,11 @@ def monitorear():
                 total_violaciones += 1
                 n = len(violaciones)
                 log(f'[{total_capturas}] ⚠  NO TODOS CUMPLEN — Sin casco: {n}  |  Con casco: {con_casco}')
+                actualizar_dashboard({
+                    'hoy':    {'violaciones': _dash_casco['hoy']['violaciones'] + 1},
+                    'alerta': {'tipo': 'mixto', 'sin_casco': n, 'con_casco': con_casco,
+                               'ts': datetime.now().strftime('%H:%M:%S')}
+                })
                 ahora = time.time()
                 if ahora - ultimo_alerta_mix >= COOLDOWN_MIXTO_S:
                     ultimo_alerta_mix = ahora
@@ -438,6 +485,7 @@ def main():
     if not cargar_modelo():
         return
 
+    actualizar_dashboard({'estado': 'activo'})
     enviar_texto_telegram(
         f'🟢 *Detector de Casco iniciado*\n'
         f'📍 Zona: {ZONA}\n'
