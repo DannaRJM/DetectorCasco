@@ -306,7 +306,11 @@ def monitorear():
         except Exception as e:
             log(f'[ERROR] ciclo principal: {e}')
 
-        time.sleep(INTERVALO_S)
+        try:
+            time.sleep(INTERVALO_S)
+        except KeyboardInterrupt:
+            log('Sistema detenido por el usuario.')
+            break
 
 # ─── Inicio ───────────────────────────────────────────────────────────────────
 def main():
