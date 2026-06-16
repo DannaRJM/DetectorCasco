@@ -1,0 +1,5 @@
+.env
+modelo/
+__pycache__/
+*.pyc
+C:/DetectorCasco/
