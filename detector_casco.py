@@ -44,7 +44,8 @@ TG_TOKEN      = os.environ.get('TELEGRAM_TOKEN', '')
 TG_CHAT       = os.environ.get('TELEGRAM_CHAT_ID','')
 INTERVALO_S   = int(os.environ.get('CHECK_INTERVAL', '10'))    # segundos entre capturas
 CONF_MIN      = float(os.environ.get('CONF_THRESHOLD', '0.50'))# confianza mínima YOLO
-COOLDOWN_S    = int(os.environ.get('ALERT_COOLDOWN',  '300'))  # 5 min anti-spam
+COOLDOWN_S       = int(os.environ.get('ALERT_COOLDOWN',       '300'))  # 5 min — todos sin casco
+COOLDOWN_MIXTO_S = int(os.environ.get('ALERT_COOLDOWN_MIXTO', '120'))  # 2 min — algunos sin casco
 MODELO_PATH   = os.environ.get('MODELO_PATH', './modelo/best.pt')
 SNAP_DIR      = Path(os.environ.get('SNAP_DIR', 'C:/DetectorCasco/snapshots'))
 ZONA          = os.environ.get('ZONA', 'Área de trabajo')
@@ -65,9 +66,10 @@ except ImportError as e:
     print('[ERROR] Ejecuta: pip install -r requirements.txt')
 
 # ─── Estado global ─────────────────────────────────────────────────────────────
-modelo         = None
-ultimo_alerta  = 0       # timestamp del último alerta enviado
-total_capturas = 0
+modelo            = None
+ultimo_alerta     = 0    # timestamp último alerta "todos sin casco"
+ultimo_alerta_mix = 0    # timestamp último alerta "algunos sin casco"
+total_capturas    = 0
 total_violaciones = 0
 
 # ─── Log ──────────────────────────────────────────────────────────────────────
@@ -217,7 +219,7 @@ def enviar_texto_telegram(texto):
 
 # ─── Ciclo principal de monitoreo ─────────────────────────────────────────────
 def monitorear():
-    global ultimo_alerta, total_capturas, total_violaciones
+    global ultimo_alerta, ultimo_alerta_mix, total_capturas, total_violaciones
 
     log(f'Iniciando monitoreo — intervalo: {INTERVALO_S}s  cooldown: {COOLDOWN_S}s')
     log(f'Zona: {ZONA}  |  Cámara: {CAM_HOST}:{CAM_PORT}')
@@ -234,37 +236,66 @@ def monitorear():
             total_detectados = len(violaciones) + con_casco
 
             if total_detectados == 0:
-                # No hay nadie en el área
                 log(f'[{total_capturas}] Sin personas detectadas en el área')
-            elif violaciones:
-                # Hay personas sin casco
+
+            elif violaciones and con_casco == 0:
+                # CASO 1: Nadie lleva casco
                 total_violaciones += 1
                 n = len(violaciones)
-                log(f'[{total_capturas}] ⚠  SIN CASCO: {n}  |  Con casco: {con_casco}')
-
+                log(f'[{total_capturas}] 🚨 TODOS SIN CASCO: {n} persona(s)')
                 ahora = time.time()
                 if ahora - ultimo_alerta >= COOLDOWN_S:
                     ultimo_alerta = ahora
-                    dt    = datetime.now()
-                    hora  = dt.strftime('%H:%M:%S')
+                    dt   = datetime.now()
+                    hora = dt.strftime('%H:%M:%S')
                     fecha = dt.strftime('%d/%m/%Y')
                     caption = '\n'.join([
-                        '🚨 *ALERTA — TRABAJADOR SIN CASCO*',
+                        '🚨 *ALERTA — TRABAJADORES SIN CASCO*',
                         '',
                         f'📍 *Zona:* {ZONA}',
-                        f'⚠️ *Sin casco:* {n}  |  ✅ *Con casco:* {con_casco}',
+                        f'⛔ *Sin casco:* {n} persona(s)',
                         f'🕐 {hora}  |  📅 {fecha}',
                         '',
-                        '_Por favor indíquele al trabajador que porte su casco_',
-                        '_para evitar accidentes._',
+                        '_Ningún trabajador en el área porta casco._',
+                        '_Por favor tome acción inmediata._',
                         '',
                         '_BluAx · Ocean Tech_'
                     ])
                     enviar_alerta_telegram(img_anotada, caption)
-                    guardar_snapshot(img_anotada, 'VIOLACION')
+                    guardar_snapshot(img_anotada, 'TODOS_SIN_CASCO')
                 else:
                     restante = int(COOLDOWN_S - (ahora - ultimo_alerta))
-                    log(f'    └─ Alerta suprimida ({restante}s restantes en cooldown)')
+                    log(f'    └─ Suprimida — próxima en {restante}s')
+
+            elif violaciones and con_casco > 0:
+                # CASO 2: Mezcla — algunos con casco, algunos sin casco
+                total_violaciones += 1
+                n = len(violaciones)
+                log(f'[{total_capturas}] ⚠  NO TODOS CUMPLEN — Sin casco: {n}  |  Con casco: {con_casco}')
+                ahora = time.time()
+                if ahora - ultimo_alerta_mix >= COOLDOWN_MIXTO_S:
+                    ultimo_alerta_mix = ahora
+                    dt   = datetime.now()
+                    hora = dt.strftime('%H:%M:%S')
+                    fecha = dt.strftime('%d/%m/%Y')
+                    caption = '\n'.join([
+                        '⚠️ *ALERTA — NO TODOS PORTAN CASCO*',
+                        '',
+                        f'📍 *Zona:* {ZONA}',
+                        f'⛔ *Sin casco:* {n}  |  ✅ *Con casco:* {con_casco}',
+                        f'🕐 {hora}  |  📅 {fecha}',
+                        '',
+                        '_No todos los trabajadores en el área_',
+                        '_están cumpliendo con el uso de casco._',
+                        '',
+                        '_BluAx · Ocean Tech_'
+                    ])
+                    enviar_alerta_telegram(img_anotada, caption)
+                    guardar_snapshot(img_anotada, 'INCUMPLIMIENTO_PARCIAL')
+                else:
+                    restante = int(COOLDOWN_MIXTO_S - (ahora - ultimo_alerta_mix))
+                    log(f'    └─ Suprimida — próxima en {restante}s')
+
             else:
                 # Todos llevan casco — OK
                 log(f'[{total_capturas}] ✅ Todos con casco ({con_casco} persona(s)) — OK')
